@@ -2417,3 +2417,392 @@ func TestEnvBleed(t *testing.T) {
 		isEqual(t, "", cfg.Foo)
 	})
 }
+
+func TestIssue440(t *testing.T) {
+	environ := map[string]string{
+		"URL":  "http://example.com/a/b",
+		"PATH": "/usr/bin",
+		"HOST": "evil",
+		"USER": "attacker",
+	}
+
+	t.Run("tagged url.URL with UseFieldNameByDefault", func(t *testing.T) {
+		type config struct {
+			URL url.URL `env:"URL"`
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment:           environ,
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, "http://example.com/a/b", cfg.URL.String())
+		isEqual(t, "example.com", cfg.URL.Host)
+		isEqual(t, "/a/b", cfg.URL.Path)
+	})
+
+	t.Run("tagged url.URL with UseFieldNameByDefault and RequiredIfNoDef", func(t *testing.T) {
+		type config struct {
+			URL url.URL `env:"URL"`
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment:           map[string]string{"URL": "http://example.com/a/b"},
+			UseFieldNameByDefault: true,
+			RequiredIfNoDef:       true,
+		})
+		isNoErr(t, err)
+		isEqual(t, "http://example.com/a/b", cfg.URL.String())
+	})
+
+	t.Run("untagged url.URL with UseFieldNameByDefault", func(t *testing.T) {
+		type config struct {
+			URL url.URL
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment:           environ,
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, "http://example.com/a/b", cfg.URL.String())
+		isEqual(t, "example.com", cfg.URL.Host)
+		isEqual(t, "/a/b", cfg.URL.Path)
+	})
+
+	t.Run("pointer url.URL with UseFieldNameByDefault", func(t *testing.T) {
+		type config struct {
+			URL *url.URL `env:"URL"`
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment:           environ,
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, "http://example.com/a/b", cfg.URL.String())
+
+		prealloc := config{URL: &url.URL{}}
+		err = ParseWithOptions(&prealloc, Options{
+			Environment:           environ,
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, "http://example.com/a/b", prealloc.URL.String())
+	})
+
+	t.Run("custom parsed struct in FuncMap with UseFieldNameByDefault", func(t *testing.T) {
+		type Endpoint struct {
+			Host string
+			Port string
+		}
+		type config struct {
+			Endpoint Endpoint `env:"ENDPOINT"`
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment: map[string]string{
+				"ENDPOINT": "myservice:8080",
+				"HOST":     "evil",
+				"PORT":     "9999",
+			},
+			UseFieldNameByDefault: true,
+			FuncMap: map[reflect.Type]ParserFunc{
+				reflect.TypeOf(Endpoint{}): func(v string) (interface{}, error) {
+					parts := strings.Split(v, ":")
+					return Endpoint{Host: parts[0], Port: parts[1]}, nil
+				},
+			},
+		})
+		isNoErr(t, err)
+		isEqual(t, "myservice", cfg.Endpoint.Host)
+		isEqual(t, "8080", cfg.Endpoint.Port)
+	})
+
+	t.Run("custom TextUnmarshaler struct with UseFieldNameByDefault", func(t *testing.T) {
+		type config struct {
+			Duration unmarshaler `env:"DUR"`
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment: map[string]string{
+				"DUR":      "10m",
+				"DURATION": "20s",
+			},
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, 10*time.Minute, cfg.Duration.Duration)
+	})
+
+	t.Run("nested config struct without custom parser still recurses with UseFieldNameByDefault", func(t *testing.T) {
+		type DBConfig struct {
+			Host string
+			Port int
+		}
+		type config struct {
+			DB DBConfig
+		}
+		var cfg config
+		err := ParseWithOptions(&cfg, Options{
+			Environment: map[string]string{
+				"HOST": "localhost",
+				"PORT": "5432",
+			},
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, "localhost", cfg.DB.Host)
+		isEqual(t, 5432, cfg.DB.Port)
+	})
+
+	t.Run("GetFieldParamsWithOptions does not recurse into url.URL", func(t *testing.T) {
+		type config struct {
+			URL url.URL `env:"URL"`
+		}
+		params, err := GetFieldParamsWithOptions(&config{}, Options{
+			UseFieldNameByDefault: true,
+		})
+		isNoErr(t, err)
+		isEqual(t, 1, len(params))
+		isEqual(t, "URL", params[0].Key)
+	})
+}
+
+func TestPointerKeyFuncMapDoesNotSuppressStructRecursion(t *testing.T) {
+	type Endpoint struct {
+		Host string `env:"HOST"`
+	}
+	type config struct {
+		Nested Endpoint
+		ByName map[string]*Endpoint `env:"ENDPOINTS"`
+	}
+
+	for _, useFieldName := range []bool{false, true} {
+		t.Run(fmt.Sprintf("UseFieldNameByDefault=%t", useFieldName), func(t *testing.T) {
+			var cfg config
+			err := ParseWithOptions(&cfg, Options{
+				Environment: map[string]string{
+					"HOST":      "localhost",
+					"ENDPOINTS": "primary:example.com",
+				},
+				UseFieldNameByDefault: useFieldName,
+				FuncMap: map[reflect.Type]ParserFunc{
+					reflect.TypeOf((*Endpoint)(nil)): func(v string) (interface{}, error) {
+						return &Endpoint{Host: v}, nil
+					},
+				},
+			})
+			isNoErr(t, err)
+			isEqual(t, "localhost", cfg.Nested.Host)
+			if cfg.ByName != nil && cfg.ByName["primary"] != nil {
+				isEqual(t, "example.com", cfg.ByName["primary"].Host)
+			} else {
+				t.Fatalf("expected cfg.ByName[\"primary\"] to be non-nil")
+			}
+		})
+	}
+
+	t.Run("pointer nested struct", func(t *testing.T) {
+		type configPtr struct {
+			Nested *Endpoint
+			ByName map[string]*Endpoint `env:"ENDPOINTS"`
+		}
+		prealloc := configPtr{Nested: &Endpoint{}}
+		err := ParseWithOptions(&prealloc, Options{
+			Environment: map[string]string{
+				"HOST":      "localhost",
+				"ENDPOINTS": "primary:example.com",
+			},
+			FuncMap: map[reflect.Type]ParserFunc{
+				reflect.TypeOf((*Endpoint)(nil)): func(v string) (interface{}, error) {
+					return &Endpoint{Host: v}, nil
+				},
+			},
+		})
+		isNoErr(t, err)
+		isEqual(t, "localhost", prealloc.Nested.Host)
+		if prealloc.ByName != nil && prealloc.ByName["primary"] != nil {
+			isEqual(t, "example.com", prealloc.ByName["primary"].Host)
+		} else {
+			t.Fatalf("expected prealloc.ByName[\"primary\"] to be non-nil")
+		}
+	})
+}
+
+func TestParseCustomScalarStructAsNestedContainer(t *testing.T) {
+	type scalar struct {
+		Value string `env:"VALUE"`
+	}
+	for _, required := range []bool{false, true} {
+		for _, useFieldName := range []bool{false, true} {
+			t.Run(fmt.Sprintf("pointer_container/useFieldName=%t/required=%t", useFieldName, required), func(t *testing.T) {
+				var cfg struct {
+					Scalar *scalar `env:"SCALAR"`
+					Nested *scalar `envPrefix:"NESTED_"`
+				}
+				cfg.Scalar = &scalar{Value: "old"}
+				cfg.Nested = &scalar{Value: "old"}
+
+				err := ParseWithOptions(&cfg, Options{
+					UseFieldNameByDefault: useFieldName,
+					RequiredIfNoDef:       required,
+					Environment: map[string]string{
+						"SCALAR":       "scalar",
+						"NESTED_VALUE": "nested",
+					},
+					FuncMap: map[reflect.Type]ParserFunc{
+						reflect.TypeOf(scalar{}): func(value string) (interface{}, error) {
+							return scalar{Value: value}, nil
+						},
+					},
+				})
+
+				isNoErr(t, err)
+				isEqual(t, "scalar", cfg.Scalar.Value)
+				isEqual(t, "nested", cfg.Nested.Value)
+			})
+
+			t.Run(fmt.Sprintf("value_container/useFieldName=%t/required=%t", useFieldName, required), func(t *testing.T) {
+				var cfg struct {
+					Scalar scalar `env:"SCALAR"`
+					Nested scalar `envPrefix:"NESTED_"`
+				}
+				cfg.Scalar = scalar{Value: "old"}
+				cfg.Nested = scalar{Value: "old"}
+
+				err := ParseWithOptions(&cfg, Options{
+					UseFieldNameByDefault: useFieldName,
+					RequiredIfNoDef:       required,
+					Environment: map[string]string{
+						"SCALAR":       "scalar",
+						"NESTED_VALUE": "nested",
+					},
+					FuncMap: map[reflect.Type]ParserFunc{
+						reflect.TypeOf(scalar{}): func(value string) (interface{}, error) {
+							return scalar{Value: value}, nil
+						},
+					},
+				})
+
+				isNoErr(t, err)
+				isEqual(t, "scalar", cfg.Scalar.Value)
+				isEqual(t, "nested", cfg.Nested.Value)
+			})
+
+			t.Run(fmt.Sprintf("slice_container/useFieldName=%t/required=%t", useFieldName, required), func(t *testing.T) {
+				var cfg struct {
+					Scalar      scalar   `env:"SCALAR"`
+					NestedSlice []scalar `envPrefix:"NESTED_"`
+				}
+				cfg.Scalar = scalar{Value: "old"}
+				cfg.NestedSlice = []scalar{{Value: "old"}}
+
+				err := ParseWithOptions(&cfg, Options{
+					UseFieldNameByDefault: useFieldName,
+					RequiredIfNoDef:       required,
+					Environment: map[string]string{
+						"SCALAR":         "scalar",
+						"NESTED_0_VALUE": "nested",
+					},
+					FuncMap: map[reflect.Type]ParserFunc{
+						reflect.TypeOf(scalar{}): func(value string) (interface{}, error) {
+							return scalar{Value: value}, nil
+						},
+					},
+				})
+
+				isNoErr(t, err)
+				isEqual(t, "scalar", cfg.Scalar.Value)
+				isEqual(t, 1, len(cfg.NestedSlice))
+				isEqual(t, "nested", cfg.NestedSlice[0].Value)
+			})
+
+			t.Run(fmt.Sprintf("ptr_slice_container/useFieldName=%t/required=%t", useFieldName, required), func(t *testing.T) {
+				var cfg struct {
+					Scalar         scalar    `env:"SCALAR"`
+					NestedPtrSlice *[]scalar `envPrefix:"NESTED_"`
+				}
+				cfg.Scalar = scalar{Value: "old"}
+				prealloc := []scalar{{Value: "old"}}
+				cfg.NestedPtrSlice = &prealloc
+
+				err := ParseWithOptions(&cfg, Options{
+					UseFieldNameByDefault: useFieldName,
+					RequiredIfNoDef:       required,
+					Environment: map[string]string{
+						"SCALAR":         "scalar",
+						"NESTED_0_VALUE": "nested",
+					},
+					FuncMap: map[reflect.Type]ParserFunc{
+						reflect.TypeOf(scalar{}): func(value string) (interface{}, error) {
+							return scalar{Value: value}, nil
+						},
+					},
+				})
+
+				isNoErr(t, err)
+				isEqual(t, "scalar", cfg.Scalar.Value)
+				if cfg.NestedPtrSlice != nil && len(*cfg.NestedPtrSlice) > 0 {
+					isEqual(t, "nested", (*cfg.NestedPtrSlice)[0].Value)
+				} else {
+					t.Fatalf("expected non-empty cfg.NestedPtrSlice")
+				}
+			})
+		}
+
+		t.Run(fmt.Sprintf("inferred_scalar/pointer_container/required=%t", required), func(t *testing.T) {
+			var cfg struct {
+				Scalar *scalar
+				Nested *scalar `envPrefix:"NESTED_"`
+			}
+			cfg.Scalar = &scalar{Value: "old"}
+			cfg.Nested = &scalar{Value: "old"}
+
+			err := ParseWithOptions(&cfg, Options{
+				UseFieldNameByDefault: true,
+				RequiredIfNoDef:       required,
+				Environment: map[string]string{
+					"SCALAR":       "scalar",
+					"NESTED_VALUE": "nested",
+				},
+				FuncMap: map[reflect.Type]ParserFunc{
+					reflect.TypeOf(scalar{}): func(value string) (interface{}, error) {
+						return scalar{Value: value}, nil
+					},
+				},
+			})
+
+			isNoErr(t, err)
+			isEqual(t, "scalar", cfg.Scalar.Value)
+			isEqual(t, "nested", cfg.Nested.Value)
+		})
+
+		t.Run(fmt.Sprintf("inferred_scalar/value_container/required=%t", required), func(t *testing.T) {
+			var cfg struct {
+				Scalar scalar
+				Nested scalar `envPrefix:"NESTED_"`
+			}
+			cfg.Scalar = scalar{Value: "old"}
+			cfg.Nested = scalar{Value: "old"}
+
+			err := ParseWithOptions(&cfg, Options{
+				UseFieldNameByDefault: true,
+				RequiredIfNoDef:       required,
+				Environment: map[string]string{
+					"SCALAR":       "scalar",
+					"NESTED_VALUE": "nested",
+				},
+				FuncMap: map[reflect.Type]ParserFunc{
+					reflect.TypeOf(scalar{}): func(value string) (interface{}, error) {
+						return scalar{Value: value}, nil
+					},
+				},
+			})
+
+			isNoErr(t, err)
+			isEqual(t, "scalar", cfg.Scalar.Value)
+			isEqual(t, "nested", cfg.Nested.Value)
+		})
+	}
+}
